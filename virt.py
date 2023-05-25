@@ -1,0 +1,347 @@
+import os
+import cv2
+from matplotlib import pyplot as plt
+import numpy as np
+from multiprocessing import Pool
+from dataclasses import dataclass
+
+
+def set_start_and_end(data, s: float = 0.0, e: float = 1.0):
+    """This function takes a numpy array, and returns a new array with the same values,
+    but scaled to fit between s and e."""
+    return (data - np.min(data)) / (np.max(data) - np.min(data)) * (e - s) + s
+
+
+def setup():
+    # Check if the data is already cached with pickle
+    if os.path.exists("data.pickle"):
+        with open("data.pickle", "rb") as f:
+            return pickle.load(f)
+
+    t15 = TrueSample.from_file("preview15.png", 15)
+    t30 = TrueSample.from_file("preview30.png", 30)
+    t45 = TrueSample.from_file("preview45.png", 45)
+    t60 = TrueSample.from_file("preview60.png", 60)
+    t75 = TrueSample.from_file("preview75.png", 75)
+
+    t30.mark_x = t30.mark_x[: -(len(t30) // 30)]
+    t30.mark_value = t30.mark_value[: -(len(t30) // 30)]
+
+    t60.mark_x = t60.mark_x[: -(len(t60) // 2)]
+    t60.mark_value = t60.mark_value[: -(len(t60) // 2)]
+
+    im_knife = cv2.imread("hema_mes_britt.JPG", cv2.IMREAD_GRAYSCALE)
+    im_knife = cv2.rotate(im_knife, cv2.ROTATE_90_CLOCKWISE)
+    im_knife = im_knife[2037:2700, 760:4020]
+    im_knife = im_knife[::, 0 : im_knife.shape[1] // 3]
+    knife_edge = KnifeEdge(im_knife, 90)
+
+    with open("data.pickle", "wb") as f:
+        pickle.dump((t15, t30, t45, t60, t75, knife_edge), f)
+
+    return t15, t30, t45, t60, t75, knife_edge
+
+
+@dataclass
+class AngledKnife:
+    """
+    This is a polynomial that represents the knife edge. It is a function
+    of x, and returns the y value of the knife edge at that x value.
+    """
+
+    knife_edge: np.poly1d
+    angle: float
+
+    def show(self) -> None:
+        ls = np.linspace(0, 1, 100)
+        plt.plot(ls, self(ls), label=f"Angle: {self.angle}")
+
+    def __call__(self, x) -> float:
+        return self.knife_edge(x)
+
+
+@dataclass
+class Sample:
+    """This is a base class for a True and a Virtual sample."""
+
+    mark_value: np.ndarray
+    mark_x: np.ndarray
+    angle: float
+
+    def __sub__(self, other: "Sample") -> float:
+        """This function calculates the difference between two samples. It does this by
+        normalizing the samples to have the same x-values, and then calculating the
+        correlation."""
+        assert isinstance(other, Sample), "Can only compare a Sample from a Sample"
+        assert abs(self.angle - other.angle) > 1, "Sample angles do not match"
+
+        def normalize_samples(x1, y1, x2, y2):
+            true_min = x1[0] if x1[0] > x2[0] else x2[0]
+            true_max = x1[-1] if x1[-1] < x2[-1] else x2[-1]
+
+            # Find the indices corresponding to true_min and true_max
+            i1_min = np.searchsorted(x1, true_min, side="left")
+            i1_max = np.searchsorted(x1, true_max, side="right")
+            i2_min = np.searchsorted(x2, true_min, side="left")
+            i2_max = np.searchsorted(x2, true_max, side="right")
+
+            # Slice the arrays to only include the values between true_min and true_max
+            x1 = x1[i1_min:i1_max]
+            y1 = y1[i1_min:i1_max]
+            x2 = x2[i2_min:i2_max]
+            y2 = y2[i2_min:i2_max]
+
+            # If the arrays are empty, return empty lists.
+            if len(x2) == len(x1) == 0:
+                return [], []
+
+            # Interpolate the arrays to have the same length and x-values.
+            if len(x2) > len(x1):
+                return np.interp(x2, x1, y1), y2
+            else:
+                return y1, np.interp(x1, x2, y2)
+
+        new_y1, new_y2 = normalize_samples(
+            self.mark_x, self.mark_value, other.mark_x, other.mark_value
+        )
+
+        return np.corrcoef(new_y1, new_y2)[1, 0]
+
+    def get_piece(self, start: float, end: float) -> "Sample":
+        """This function returns a new Sample object, that is a piece of the original"""
+        ls = np.linspace(start, end, len(self.mark_value))
+        return Sample(self.mark_value, ls, self.angle)
+
+    def show(self):
+        plt.plot(self.mark_x, self.mark_value, label=f"Angle: {self.angle}")
+
+    def __len__(self) -> int:
+        return len(self.mark_value)
+
+    def __getitem__(self, x: int):
+        return self.mark_value[x]
+
+
+class TrueSample(Sample):
+    """This class represents a sample that has been measured with a real knife edge."""
+
+    def __init__(self, mark: np.ndarray, angle: float):
+        return super().__init__(mark, np.linspace(0, 1, len(mark)), angle)
+
+    @staticmethod
+    def from_file(file_name: str, angle: float) -> "TrueSample":
+        """Reads a sample from a file, and create a TrueSample object from it."""
+        im = cv2.imread(file_name, cv2.IMREAD_GRAYSCALE)
+        return TrueSample(np.median(im, axis=1), angle)
+
+
+class VirtualSample(Sample):
+    """This class represents a sample that has been generated by the simulation."""
+
+    def __init__(self, knife: "AngledKnife", value, xs, angle: float):
+        self.mark_value = value
+        angle = np.deg2rad(angle)
+        self.angle = angle
+
+        self.mark_x = xs * np.cos(angle) - knife(xs) * np.sin(angle)
+
+
+class KnifeEdge:
+    """This class represents a knife edge."""
+
+    x_vals: np.ndarray
+    y_vals: np.ndarray
+    angle_offset: float
+    im: np.ndarray
+
+    def __init__(self, img, angle=90):
+        """This function takes an image, and calculates the knife edge.
+        It also takes an angle, which is the angle of the knife edge in the image."""
+        self.angle_offset = angle
+        edges = cv2.Canny(img, 100, 200)
+
+        x, y = [], []
+        for pixel in sorted(np.argwhere(edges == 255), key=lambda x: x[1]):
+            if pixel[1] not in x:
+                x.append(pixel[1])
+                y.append(pixel[0])
+        mx = max(x)
+        self.x_vals = np.array(x) / mx
+        self.y_vals = np.array(y) / mx
+
+    def at_angle(self, angle, degree=8) -> AngledKnife:
+        """This function returns a new AngledKnife object, that is the knife
+        edge rotated and fitted to a polynomial."""
+        angle = np.deg2rad(-angle)
+        x_rot = self.x_vals * np.cos(angle) - self.y_vals * np.sin(angle)
+        y_rot = self.x_vals * np.sin(angle) + self.y_vals * np.cos(angle)
+
+        return AngledKnife(np.poly1d(np.polyfit(x_rot, y_rot, degree)), angle)
+
+    def show(self):
+        plt.imshow(self.im, cmap="gray")
+
+
+@dataclass()
+class SearchSpace:
+    its = 0
+    x1_min, x1_max, y1_min, y1_max, x2_min, x2_max, y2_min, y2_max = (
+        0.0,
+        0.25,
+        0.75,
+        1,
+        0.0,
+        0.25,
+        0.75,
+        1,
+    )
+    KNIFE_FIT_RES: int = 10
+
+    def zoom_around(self, r: "Result"):
+        delta = (0.5) ** (self.its + 3)
+        self.x1_min = max(r.b1 - delta, 0)
+        self.x1_max = min(r.b1 + delta, 1)
+        self.y1_min = max(r.e1 - delta, 0)
+        self.y1_max = min(r.e1 + delta, 1)
+        self.x2_min = max(r.b2 - delta, 0)
+        self.x2_max = min(r.b2 + delta, 1)
+        self.y2_min = max(r.e2 - delta, 0)
+        self.y2_max = min(r.e2 + delta, 1)
+        print(delta)
+
+    def get_linspaces(self):
+        x1space = np.linspace(self.x1_min, self.x1_max, self.KNIFE_FIT_RES)
+        y1space = np.linspace(self.y1_min, self.y1_max, self.KNIFE_FIT_RES)
+        x2space = np.linspace(self.x2_min, self.x2_max, self.KNIFE_FIT_RES)
+        y2space = np.linspace(self.y2_min, self.y2_max, self.KNIFE_FIT_RES)
+
+        self.its += 1
+
+        return x1space, y1space, x2space, y2space
+
+
+@dataclass()
+class Result:
+    corr, b1, e1, b2, e2 = -1, 0, 0, 0, 0
+
+    def __init__(self, corr=None, b1=None, e1=None, b2=None, e2=None):
+        if corr is not None:
+            self.corr = corr
+            self.b1, self.e1, self.b2, self.e2 = b1, e1, b2, e2
+
+    def set_if_better(self, corr, x1, y1, x2, y2):
+        if corr > self.corr:
+            self.corr = corr
+            self.b1, self.e1, self.b2, self.e2 = x1, y1, x2, y2
+
+    def __iter__(self):
+        return iter([self.corr, self.b1, self.e1, self.b2, self.e2])
+
+    def __repr__(self) -> str:
+        return f"Result(corr={self.corr}, b1={self.b1}, e1={self.e1}, b2={self.b2}, e2={self.e2})"
+
+
+class VirtualKnife:
+    """This class represents a virtual knife edge. It is created by trying to fit two TrueSamples on a KnifeEdge."""
+
+    sample1: TrueSample
+    sample2: TrueSample
+    knife_edge: KnifeEdge
+    fit: Result
+    sp: SearchSpace
+
+    KNIFE_FIT_RES = 14
+    TOTAL_THREADS: int = 4
+
+    def __init__(self, sample1: TrueSample, sample2: TrueSample, k: KnifeEdge):
+        self.sample1 = sample1
+        self.sample2 = sample2
+        self.knife_edge = k
+
+        self.sp = SearchSpace()
+        self.sp.KNIFE_FIT_RES = self.KNIFE_FIT_RES
+        self.fit = Result()
+
+    def increase_fit(self, save=True):
+        """This function tries to find a better fit for the knife edge by searching the parameter space."""
+        m = Result()
+
+        x1space, y1space, x2space, y2space = self.sp.get_linspaces()
+
+        with Pool(self.TOTAL_THREADS) as pool:
+            for result in pool.map(
+                self.worker,
+                [
+                    (begin1, end1, x2space, y2space)
+                    for begin1 in x1space
+                    for end1 in y1space
+                    if end1 > begin1
+                ],
+            ):
+                m.set_if_better(*result)
+
+        self.sp.zoom_around(m)
+
+        if self.fit.corr < m.corr:
+            self.fit = m
+
+
+    def worker(self, args) -> Result:
+        """Worker for the multiprocessing pool."""
+        begin1, end1, x2space, y2space = args
+
+        # Set start and end of the first mark
+        VirtualKnifeAtAngle1 = self.knife_edge.at_angle(self.sample1.angle)
+        virtual_sample_at_angle2 = VirtualSample(
+            VirtualKnifeAtAngle1,
+            self.sample1.mark_value,
+            np.linspace(begin1, end1, len(self.sample1)),
+            -(self.sample2.angle - self.sample1.angle),
+        )
+
+        inner_m = Result()
+        for begin2 in x2space:
+            for end2 in y2space:
+                if end2 <= begin2:
+                    continue
+
+                real_sample_at_angle2 = self.sample2.get_piece(begin2, end2)
+                rs = virtual_sample_at_angle2 - real_sample_at_angle2
+
+                inner_m.set_if_better(rs, begin1, end1, begin2, end2)
+
+        return inner_m
+
+    def increase_fit_no_mp(self) -> None:
+        """This function tries to find a better fit for the knife edge by searching the parameter space."""
+        m = Result()
+
+        x1space, y1space, x2space, y2space = self.sp.get_linspaces()
+        VirtualKnifeAtAngle1 = self.knife_edge.at_angle(self.sample1.angle)
+
+        for begin1 in x1space:
+            for end1 in y1space:
+
+                if end1 <= begin1:
+                    continue
+
+                virtual_sample_at_angle2 = VirtualSample(
+                    VirtualKnifeAtAngle1,
+                    self.sample1.mark_value,
+                    np.linspace(begin1, end1, len(self.sample1)),
+                    -(self.sample2.angle - self.sample1.angle),
+                )
+
+                m = Result()
+                for begin2 in x2space:
+                    for end2 in y2space:
+                        if end2 <= begin2:
+                            continue
+
+                        real_sample_at_angle2 = self.sample2.get_piece(begin2, end2)
+                        rs = virtual_sample_at_angle2 - real_sample_at_angle2
+
+                        m.set_if_better(rs, begin1, end1, begin2, end2)
+
+        self.sp.zoom_around(m)
+        self.fit = m
